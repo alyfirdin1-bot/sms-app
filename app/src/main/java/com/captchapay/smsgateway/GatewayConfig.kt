@@ -20,17 +20,62 @@ object GatewayConfig {
     private const val KEY_PENDING_QUEUE = "pending_sms_queue"
     private const val KEY_LOCAL_LOGS = "local_sms_logs"
     private const val KEY_TOTAL_SENT = "total_sent_count"
+    private const val KEY_PREVIEW_COOKIE = "preview_session_cookie"
+    private const val KEY_FIRESTORE_URL = "firestore_url"
+    private const val KEY_FIREBASE_API_KEY = "firebase_api_key"
+
+    const val DEFAULT_FIRESTORE_URL =
+        "https://firestore.googleapis.com/v1/projects/gen-lang-client-0557312943/databases/ai-studio-taskearnhub-f7292225-6c41-41e6-a48d-cf09d4917289/documents"
+    const val DEFAULT_FIREBASE_API_KEY = "AIzaSyBfK91sQ1VVxsopLh6l8Astaz3n0hOOmHk"
 
     const val ACTION_LOG_UPDATED = "com.captchapay.smsgateway.ACTION_LOG_UPDATED"
 
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
 
+    fun normalizeServerUrl(raw: String): String {
+        var clean = raw.trim().trimEnd('/')
+        val apiIdx = clean.indexOf("/api/deposit-gateway")
+        if (apiIdx > 0) {
+            clean = clean.substring(0, apiIdx).trimEnd('/')
+        }
+        return clean
+    }
+
     fun getServerUrl(context: Context): String =
-        (prefs(context).getString(KEY_SERVER_URL, "") ?: "").trim().trimEnd('/')
+        normalizeServerUrl(prefs(context).getString(KEY_SERVER_URL, "") ?: "")
+
+    fun getFirestoreUrl(context: Context): String =
+        (prefs(context).getString(KEY_FIRESTORE_URL, DEFAULT_FIRESTORE_URL) ?: DEFAULT_FIRESTORE_URL)
+            .trim()
+            .trimEnd('/')
+            .ifEmpty { DEFAULT_FIRESTORE_URL }
+
+    fun getFirebaseApiKey(context: Context): String =
+        (prefs(context).getString(KEY_FIREBASE_API_KEY, DEFAULT_FIREBASE_API_KEY) ?: DEFAULT_FIREBASE_API_KEY)
+            .trim()
+            .ifEmpty { DEFAULT_FIREBASE_API_KEY }
+
+    fun setFirestoreConnection(context: Context, firestoreUrl: String, firebaseApiKey: String) {
+        val editor = prefs(context).edit()
+        if (firestoreUrl.trim().startsWith("https://")) {
+            editor.putString(KEY_FIRESTORE_URL, firestoreUrl.trim().trimEnd('/'))
+        }
+        if (firebaseApiKey.trim().isNotEmpty()) {
+            editor.putString(KEY_FIREBASE_API_KEY, firebaseApiKey.trim())
+        }
+        editor.apply()
+    }
 
     fun getGatewayToken(context: Context): String =
         (prefs(context).getString(KEY_GATEWAY_TOKEN, "") ?: "").trim()
+
+    fun getPreviewCookie(context: Context): String =
+        (prefs(context).getString(KEY_PREVIEW_COOKIE, "") ?: "").trim()
+
+    fun setPreviewCookie(context: Context, cookie: String) {
+        prefs(context).edit().putString(KEY_PREVIEW_COOKIE, cookie.trim()).apply()
+    }
 
     fun getDeviceId(context: Context): String {
         val p = prefs(context)
@@ -39,7 +84,7 @@ object GatewayConfig {
             id = "android-${UUID.randomUUID().toString().take(12)}"
             p.edit().putString(KEY_DEVICE_ID, id).apply()
         }
-        return id
+        return id.replace(Regex("[^a-zA-Z0-9_\\-]"), "-")
     }
 
     fun getDeviceName(context: Context): String {
@@ -66,17 +111,21 @@ object GatewayConfig {
         paymentOnly: Boolean
     ) {
         prefs(context).edit()
-            .putString(KEY_SERVER_URL, serverUrl.trim().trimEnd('/'))
+            .putString(KEY_SERVER_URL, normalizeServerUrl(serverUrl))
             .putString(KEY_GATEWAY_TOKEN, token.trim())
             .putString(KEY_DEVICE_NAME, deviceName.trim().ifEmpty { "${Build.MANUFACTURER} ${Build.MODEL}" })
             .putBoolean(KEY_PAYMENT_ONLY, paymentOnly)
             .apply()
     }
 
-    fun isConfigured(context: Context): Boolean {
+    fun isDirectFirestorePrimary(context: Context): Boolean {
         val url = getServerUrl(context)
+        return url.isEmpty() || url.contains("ais-dev-") || url.contains("ais-pre-")
+    }
+
+    fun isConfigured(context: Context): Boolean {
         val token = getGatewayToken(context)
-        return (url.startsWith("https://") || url.startsWith("http://")) && token.length >= 12
+        return token.length >= 16 && getFirestoreUrl(context).startsWith("https://")
     }
 
     fun incrementSentCount(context: Context): Int {
@@ -95,7 +144,6 @@ object GatewayConfig {
         val raw = p.getString(KEY_PENDING_QUEUE, "[]") ?: "[]"
         val arr = try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
         arr.put(payload)
-        // Keep bounded to last 200 items
         val trimmed = JSONArray()
         val start = maxOf(0, arr.length() - 200)
         for (i in start until arr.length()) {

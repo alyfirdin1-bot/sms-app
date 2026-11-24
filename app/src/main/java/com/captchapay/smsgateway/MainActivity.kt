@@ -13,12 +13,15 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Button
 import android.widget.EditText
+import android.widget.RadioGroup
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import org.json.JSONObject
 
 class MainActivity : AppCompatActivity() {
@@ -30,12 +33,33 @@ class MainActivity : AppCompatActivity() {
     private lateinit var etGatewayToken: EditText
     private lateinit var etDeviceName: EditText
     private lateinit var swPaymentOnly: Switch
+    private lateinit var rgTestMethod: RadioGroup
+    private lateinit var etTestAmount: EditText
+    private lateinit var etTestTrxId: EditText
+    private lateinit var etTestSender: EditText
+    private lateinit var tvPreviewCookieStatus: TextView
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         refreshUi()
         Toast.makeText(this, "Permissions updated", Toast.LENGTH_SHORT).show()
+    }
+
+    private val previewLoginLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        refreshUi()
+        if (GatewayConfig.isConfigured(this)) {
+            GatewayApiClient.sendHeartbeatAsync(this) { res ->
+                runOnUiThread {
+                    if (res.ok) {
+                        Toast.makeText(this, "Preview URL Connected ✓", Toast.LENGTH_SHORT).show()
+                    }
+                    refreshUi()
+                }
+            }
+        }
     }
 
     private val logUpdateReceiver = object : BroadcastReceiver() {
@@ -48,6 +72,15 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        val rootView = findViewById<android.view.View>(android.R.id.content)
+        val density = resources.displayMetrics.density
+        val padPx = (16 * density).toInt()
+        ViewCompat.setOnApplyWindowInsetsListener(rootView) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(bars.left, bars.top + (padPx / 2), bars.right, bars.bottom)
+            insets
+        }
+
         tvServiceStatus = findViewById(R.id.tvServiceStatus)
         tvPermissionSummary = findViewById(R.id.tvPermissionSummary)
         tvLogs = findViewById(R.id.tvLogs)
@@ -55,6 +88,11 @@ class MainActivity : AppCompatActivity() {
         etGatewayToken = findViewById(R.id.etGatewayToken)
         etDeviceName = findViewById(R.id.etDeviceName)
         swPaymentOnly = findViewById(R.id.swPaymentOnly)
+        rgTestMethod = findViewById(R.id.rgTestMethod)
+        etTestAmount = findViewById(R.id.etTestAmount)
+        etTestTrxId = findViewById(R.id.etTestTrxId)
+        etTestSender = findViewById(R.id.etTestSender)
+        tvPreviewCookieStatus = findViewById(R.id.tvPreviewCookieStatus)
 
         etServerUrl.setText(GatewayConfig.getServerUrl(this))
         etGatewayToken.setText(GatewayConfig.getGatewayToken(this))
@@ -98,24 +136,62 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        findViewById<Button>(R.id.btnPreviewLogin).setOnClickListener {
+            persistInputs()
+            val url = GatewayConfig.getServerUrl(this)
+            if (!url.startsWith("https://") && !url.startsWith("http://")) {
+                Toast.makeText(this, "Enter or Paste Admin Config JSON first", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val intent = Intent(this, PreviewLoginActivity::class.java).apply {
+                putExtra(PreviewLoginActivity.EXTRA_SERVER_URL, url)
+            }
+            previewLoginLauncher.launch(intent)
+        }
+
         findViewById<Button>(R.id.btnTestSms).setOnClickListener {
             persistInputs()
-            val sampleSms =
-                "You have received Tk 500.00 from 01712345678. Fee Tk 0.00. Balance Tk 2500.00. TrxID TEST${System.currentTimeMillis().toString().takeLast(6)}"
+            if (!GatewayConfig.isConfigured(this)) {
+                Toast.makeText(this, "Enter HTTPS Server URL & Gateway Token first", Toast.LENGTH_LONG).show()
+                return@setOnClickListener
+            }
+
+            val rawAmount = etTestAmount.text.toString().trim().ifEmpty { "500" }
+            val cleanAmount = rawAmount.toDoubleOrNull()?.let {
+                String.format(java.util.Locale.US, "%.2f", it)
+            } ?: run {
+                Toast.makeText(this, "Enter a valid numeric Amount", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            val cleanTrxId = etTestTrxId.text.toString().trim().uppercase()
+                .ifEmpty { "TEST${System.currentTimeMillis().toString().takeLast(6)}" }
+            val cleanPhone = etTestSender.text.toString().trim().ifEmpty { "01712345678" }
+
+            val (senderName, sampleSms) = when (rgTestMethod.checkedRadioButtonId) {
+                R.id.rbMethodNagad -> "NAGAD" to
+                    "Money Received. Amount: Tk $cleanAmount Sender: $cleanPhone Ref: test. TxnID: $cleanTrxId"
+                R.id.rbMethodRocket -> "Rocket" to
+                    "Tk$cleanAmount received from A/C:$cleanPhone. Fee:Tk0.00. Your Balance is Tk5000.00. TxnId:$cleanTrxId"
+                else -> "bKash" to
+                    "You have received Tk $cleanAmount from $cleanPhone. Fee Tk 0.00. Balance Tk 2500.00. TrxID $cleanTrxId"
+            }
+
             GatewayApiClient.postSmsAsync(
                 context = this,
-                sender = "bKash",
+                sender = senderName,
                 body = sampleSms,
                 receivedAtMs = System.currentTimeMillis(),
                 simSlot = 1,
                 isTest = true
             ) { res ->
                 runOnUiThread {
-                    Toast.makeText(
-                        this,
-                        if (res.ok) "Test SMS forwarded ✓" else "Error (${res.code}): ${res.message}",
-                        Toast.LENGTH_LONG
-                    ).show()
+                    val toastText = if (res.ok) {
+                        "Cloud Received 24/7 ✓ ($senderName ৳$cleanAmount • $cleanTrxId)"
+                    } else {
+                        "Failed (${res.code}): ${res.message.take(90)}"
+                    }
+                    Toast.makeText(this, toastText, Toast.LENGTH_LONG).show()
                     refreshUi()
                 }
             }
@@ -157,7 +233,7 @@ class MainActivity : AppCompatActivity() {
     private fun saveAndStartMonitor() {
         persistInputs()
         if (!GatewayConfig.isConfigured(this)) {
-            Toast.makeText(this, "Enter valid HTTPS Server URL & Gateway Token", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Paste Permanent Deposit API Key first", Toast.LENGTH_LONG).show()
             return
         }
         if (!GatewayApiClient.hasSmsPermissions(this)) {
@@ -207,11 +283,18 @@ class MainActivity : AppCompatActivity() {
         }
         try {
             val json = JSONObject(raw)
-            val url = json.optString("serverUrl").trim()
+            val url = GatewayConfig.normalizeServerUrl(json.optString("serverUrl"))
             val token = json.optString("gatewayToken").trim()
+            val fsUrl = json.optString("firestoreUrl").trim()
+            val fsKey = json.optString("firebaseApiKey").trim()
             if (url.isNotEmpty()) etServerUrl.setText(url)
             if (token.isNotEmpty()) etGatewayToken.setText(token)
-            Toast.makeText(this, "Admin Gateway Config imported ✓", Toast.LENGTH_SHORT).show()
+            if (fsUrl.isNotEmpty() || fsKey.isNotEmpty()) {
+                GatewayConfig.setFirestoreConnection(this, fsUrl, fsKey)
+            }
+            persistInputs()
+            refreshUi()
+            Toast.makeText(this, "Admin 24/7 Cloud Config imported ✓", Toast.LENGTH_SHORT).show()
         } catch (_: Exception) {
             Toast.makeText(this, "Copy Config JSON from Admin Panel first", Toast.LENGTH_LONG).show()
         }
@@ -242,6 +325,16 @@ class MainActivity : AppCompatActivity() {
             append("READ_SMS: ").append(if (readGranted) "GRANTED ✓" else "MISSING ✗").append("\n")
             append("NOTIFICATIONS: ").append(if (notifGranted) "GRANTED ✓" else "MISSING ✗").append("\n")
             append("BATTERY UNRESTRICTED: ").append(if (batteryExempt) "YES ✓" else "NO (Tap button)")
+        }
+
+        tvPreviewCookieStatus.text = if (GatewayConfig.isConfigured(this)) {
+            if (GatewayConfig.isDirectFirestorePrimary(this)) {
+                "Direct 24/7 Cloud Bridge: ACTIVE ✓ (No Hosting Account or Login Needed)"
+            } else {
+                "Custom Server + Cloud Backup: ACTIVE ✓"
+            }
+        } else {
+            "Setup: Tap 'Paste Admin JSON' then 'Save & Start Monitor'"
         }
 
         tvLogs.text = GatewayConfig.getLocalLogs(this)
