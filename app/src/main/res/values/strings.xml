@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CaptchaPay SMS Gateway</string>
+    <string name="channel_name">Deposit SMS Monitor</string>
+    <string name="channel_desc">24/7 background monitor for bKash, Nagad, and Rocket deposit SMS verification</string>
+</resources>
