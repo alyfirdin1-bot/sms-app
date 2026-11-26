@@ -23,6 +23,11 @@ object GatewayConfig {
     private const val KEY_PREVIEW_COOKIE = "preview_session_cookie"
     private const val KEY_FIRESTORE_URL = "firestore_url"
     private const val KEY_FIREBASE_API_KEY = "firebase_api_key"
+    private const val KEY_STRICT_SENDER_WHITELIST = "strict_sender_whitelist"
+    private const val KEY_TRUSTED_SENDERS = "trusted_senders_csv"
+
+    const val DEFAULT_TRUSTED_SENDERS_CSV =
+        "BKASH,NAGAD,16216,ROCKET,DBBL,UPAY,CELLFIN,BINANCE,TAP,OKWALLET"
 
     const val DEFAULT_FIRESTORE_URL =
         "https://firestore.googleapis.com/v1/projects/gen-lang-client-0557312943/databases/ai-studio-taskearnhub-f7292225-6c41-41e6-a48d-cf09d4917289/documents"
@@ -183,6 +188,70 @@ object GatewayConfig {
 
     fun getLocalLogs(context: Context): String =
         prefs(context).getString(KEY_LOCAL_LOGS, "No SMS captured yet.") ?: "No SMS captured yet."
+
+    fun isStrictSenderWhitelist(context: Context): Boolean =
+        prefs(context).getBoolean(KEY_STRICT_SENDER_WHITELIST, true)
+
+    fun setStrictSenderWhitelist(context: Context, enabled: Boolean) {
+        prefs(context).edit().putBoolean(KEY_STRICT_SENDER_WHITELIST, enabled).apply()
+    }
+
+    fun getTrustedSenders(context: Context): List<String> {
+        val raw = prefs(context).getString(KEY_TRUSTED_SENDERS, DEFAULT_TRUSTED_SENDERS_CSV)
+            ?: DEFAULT_TRUSTED_SENDERS_CSV
+        val list = raw.split(",")
+            .map { it.trim().uppercase(Locale.US).replace(Regex("[^A-Z0-9_\\-]"), "") }
+            .filter { it.length in 2..32 }
+            .distinct()
+        return if (list.isNotEmpty()) list else DEFAULT_TRUSTED_SENDERS_CSV.split(",")
+    }
+
+    fun setTrustedSenders(context: Context, senders: List<String>) {
+        val cleaned = senders
+            .map { it.trim().uppercase(Locale.US).replace(Regex("[^A-Z0-9_\\-]"), "") }
+            .filter { it.length in 2..32 }
+            .distinct()
+            .take(40)
+        if (cleaned.isNotEmpty()) {
+            prefs(context).edit().putString(KEY_TRUSTED_SENDERS, cleaned.joinToString(",")).apply()
+        }
+    }
+
+    fun isPersonalPhoneSender(sender: String): Boolean {
+        val compact = sender.trim().replace(Regex("[\\s\\-()]"), "")
+        if (compact.isEmpty()) return true
+        if (Regex("^(\\+?88)?01[3-9]\\d{8,9}$").matches(compact)) return true
+        if (Regex("^\\+?\\d{7,16}$").matches(compact)) return true
+        return false
+    }
+
+    fun isTrustedPaymentSender(context: Context, sender: String): Pair<Boolean, String?> {
+        if (!isStrictSenderWhitelist(context)) return Pair(true, null)
+        val raw = sender.trim()
+        val normalized = raw.uppercase(Locale.US).replace(Regex("[^A-Z0-9_\\-]"), "")
+        val whitelist = getTrustedSenders(context)
+
+        if (isPersonalPhoneSender(raw)) {
+            val digitsOnly = raw.replace(Regex("\\D"), "")
+            val isShortcode = digitsOnly.length <= 6 && whitelist.contains(digitsOnly)
+            if (!isShortcode) {
+                return Pair(false, "Spoofing blocked: personal phone number ($raw)")
+            }
+        }
+        if (normalized.isEmpty()) {
+            return Pair(false, "Spoofing blocked: empty sender ID")
+        }
+        val matched = whitelist.any { allowed ->
+            normalized == allowed || normalized.contains(allowed)
+        }
+        if (!matched) {
+            return Pair(false, "Spoofing blocked: untrusted sender ($raw)")
+        }
+        return Pair(true, null)
+    }
+
+    fun getPendingCount(context: Context): Int =
+        OfflineSmsDb.getInstance(context).getPendingCount()
 
     fun isPaymentSms(sender: String, body: String): Boolean {
         val combined = "$sender $body".lowercase(Locale.getDefault())

@@ -8,6 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -42,10 +46,21 @@ class SmsMonitorService : Service() {
     }
 
     private val handler = Handler(Looper.getMainLooper())
+    private var networkCallbackRegistered = false
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            if (GatewayConfig.getPendingCount(applicationContext) > 0) {
+                GatewayApiClient.flushPendingQueueAsync(applicationContext) {
+                    handler.post { updateNotification() }
+                }
+            }
+        }
+    }
+
     private val heartbeatRunnable = object : Runnable {
         override fun run() {
             GatewayApiClient.sendHeartbeatAsync(applicationContext) {
-                updateNotification()
+                handler.post { updateNotification() }
             }
             handler.postDelayed(this, HEARTBEAT_INTERVAL_MS)
         }
@@ -65,7 +80,23 @@ class SmsMonitorService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notif)
         }
+        registerConnectivityFlashRetry()
+        if (GatewayConfig.getPendingCount(applicationContext) > 0) {
+            SmsFlushWorker.scheduleFlush(applicationContext)
+        }
         handler.post(heartbeatRunnable)
+    }
+
+    private fun registerConnectivityFlashRetry() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(request, networkCallback)
+            networkCallbackRegistered = true
+        } catch (_: Exception) {
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -78,6 +109,14 @@ class SmsMonitorService : Service() {
     override fun onDestroy() {
         isRunning = false
         handler.removeCallbacks(heartbeatRunnable)
+        if (networkCallbackRegistered) {
+            try {
+                val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                cm?.unregisterNetworkCallback(networkCallback)
+            } catch (_: Exception) {
+            }
+            networkCallbackRegistered = false
+        }
         super.onDestroy()
     }
 
@@ -103,9 +142,9 @@ class SmsMonitorService : Service() {
         val pendingIntent = PendingIntent.getActivity(this, 0, openIntent, pendingFlags)
 
         val sent = GatewayConfig.getTotalSentCount(applicationContext)
-        val queued = GatewayConfig.getPendingQueue(applicationContext).size
+        val queued = GatewayConfig.getPendingCount(applicationContext)
         val statusText = if (GatewayApiClient.hasSmsPermissions(applicationContext)) {
-            "24/7 Active • Forwarded: $sent • Queued: $queued"
+            "24/7 Shield Active • Sent: $sent • SQLite Buffer: $queued"
         } else {
             "SMS Permission Needed! Tap to grant access"
         }

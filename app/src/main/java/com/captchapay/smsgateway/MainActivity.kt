@@ -314,10 +314,12 @@ class MainActivity : AppCompatActivity() {
         } else true
         val batteryExempt = GatewayApiClient.isIgnoringBatteryOptimizations(this)
 
+        val pendingBuffered = GatewayConfig.getPendingCount(this)
+        val shieldStatus = if (GatewayConfig.isStrictSenderWhitelist(this)) "Shield ON ✓" else "Shield OFF"
         tvServiceStatus.text = if (SmsMonitorService.isRunning) {
-            "Status: RUNNING 24/7 • Sent: ${GatewayConfig.getTotalSentCount(this)} • Pending: ${GatewayConfig.getPendingQueue(this).size}"
+            "Status: RUNNING 24/7 • Sent: ${GatewayConfig.getTotalSentCount(this)} • Buffer: $pendingBuffered • $shieldStatus"
         } else {
-            "Status: STOPPED • Sent: ${GatewayConfig.getTotalSentCount(this)}"
+            "Status: STOPPED • Sent: ${GatewayConfig.getTotalSentCount(this)} • Buffer: $pendingBuffered • $shieldStatus"
         }
 
         tvPermissionSummary.text = buildString {
@@ -329,9 +331,9 @@ class MainActivity : AppCompatActivity() {
 
         tvPreviewCookieStatus.text = if (GatewayConfig.isConfigured(this)) {
             if (GatewayConfig.isDirectFirestorePrimary(this)) {
-                "Direct 24/7 Cloud Bridge: ACTIVE ✓ (No Hosting Account or Login Needed)"
+                "Direct 24/7 Cloud Bridge + SQLite Offline Buffer: ACTIVE ✓"
             } else {
-                "Custom Server + Cloud Backup: ACTIVE ✓"
+                "Server + Cloud Backup + SQLite Flash-Sync: ACTIVE ✓"
             }
         } else {
             "Setup: Tap 'Paste Admin JSON' then 'Save & Start Monitor'"

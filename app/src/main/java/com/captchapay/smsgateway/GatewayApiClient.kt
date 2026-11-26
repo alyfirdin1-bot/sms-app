@@ -190,6 +190,7 @@ object GatewayApiClient {
         val cleanBody = rawBody.trim().take(2000)
         val cleanSender = sender.trim().take(80).ifEmpty { "Unknown" }
         val parsed = SmsParser.parse(cleanSender, cleanBody)
+        val (isTrustedSender, blockReason) = GatewayConfig.isTrustedPaymentSender(context, cleanSender)
 
         val baseDocPath = GatewayConfig.getFirestoreUrl(context).substringAfter("/v1/")
         val smsId = "SMSGW-${receivedAtMs}-${UUID.randomUUID().toString().replace("-", "").take(6).uppercase(Locale.US)}"
@@ -207,13 +208,17 @@ object GatewayApiClient {
             put("smsSender", fsStr(cleanSender))
             put("simSlot", fsInt(simSlot.toLong()))
             put("rawBody", fsStr(cleanBody))
-            put("confidence", fsStr(parsed.confidence))
+            put("confidence", fsStr(if (isTrustedSender) parsed.confidence else "none"))
             put("source", fsStr("android"))
             put("isTest", fsBool(isTest))
             put("apiKey", fsStr(token))
             parsed.detectedMethod?.let { put("detectedMethod", fsStr(it.take(40))) }
-            parsed.amount?.let { put("amount", fsDouble(it)) }
-            parsed.trxId?.let { put("trxId", fsStr(it.take(64))) }
+            if (isTrustedSender) {
+                parsed.amount?.let { put("amount", fsDouble(it)) }
+                parsed.trxId?.let { put("trxId", fsStr(it.take(64))) }
+            } else {
+                GatewayConfig.appendLocalLog(context, "🛡 SPOOF BLOCKED [$cleanSender]: ${blockReason ?: "Untrusted sender"}")
+            }
             parsed.senderNumber?.let { put("senderNumber", fsStr(it.take(40))) }
         }
 
@@ -228,7 +233,7 @@ object GatewayApiClient {
         }
 
         val trxSanitized = parsed.trxId?.uppercase(Locale.US)?.replace(Regex("[^A-Z0-9_\\-]"), "") ?: ""
-        val validTrxForLookup = trxSanitized.length in 4..64 && (parsed.amount ?: 0.0) >= 10.0
+        val validTrxForLookup = isTrustedSender && trxSanitized.length in 4..64 && (parsed.amount ?: 0.0) >= 10.0
 
         if (validTrxForLookup) {
             val lookupFields = JSONObject().apply {
@@ -255,7 +260,7 @@ object GatewayApiClient {
             }
         }
 
-        // Fallback commit inbox record alone (e.g., if TrxID already existed in lookup on repeat test)
+        // Fallback commit inbox record alone (e.g., if TrxID already existed in lookup on repeat test, or spoofed SMS blocked from lookup)
         val singleRes = postFirestoreCommit(context, JSONArray().put(inboxWrite))
         return Pair(
             if (singleRes.ok) ApiResult(true, singleRes.code, smsId) else singleRes,
@@ -280,9 +285,9 @@ object GatewayApiClient {
             put("networkType", fsStr(readNetworkType(context).take(40)))
             put("permissionsGranted", fsBool(hasSmsPermissions(context)))
             put("batteryUnrestricted", fsBool(isIgnoringBatteryOptimizations(context)))
-            put("queueDepth", fsInt(GatewayConfig.getPendingQueue(context).size.toLong()))
+            put("queueDepth", fsInt(OfflineSmsDb.getInstance(context).getPendingCount().toLong()))
             put("totalSmsSent", fsInt(GatewayConfig.getTotalSentCount(context).toLong()))
-            put("appVersion", fsStr("2.0.0-cloud"))
+            put("appVersion", fsStr("2.1.0-shield"))
             put("lastHeartbeatIso", fsStr(isoUtc(System.currentTimeMillis())))
             put("apiKey", fsStr(token))
         }
@@ -300,6 +305,28 @@ object GatewayApiClient {
         return postFirestoreCommit(context, JSONArray().put(write))
     }
 
+    private fun applyHeartbeatConfigResponse(context: Context, responseBody: String) {
+        try {
+            val json = JSONObject(responseBody)
+            if (json.has("strictSenderWhitelist")) {
+                GatewayConfig.setStrictSenderWhitelist(
+                    context,
+                    json.optBoolean("strictSenderWhitelist", true)
+                )
+            }
+            val arr = json.optJSONArray("trustedSenders")
+            if (arr != null && arr.length() > 0) {
+                val list = mutableListOf<String>()
+                for (i in 0 until arr.length()) {
+                    val s = arr.optString(i).trim()
+                    if (s.isNotEmpty()) list.add(s)
+                }
+                GatewayConfig.setTrustedSenders(context, list)
+            }
+        } catch (_: Exception) {
+        }
+    }
+
     fun postSmsAsync(
         context: Context,
         sender: String,
@@ -310,23 +337,45 @@ object GatewayApiClient {
         onComplete: ((ApiResult) -> Unit)? = null
     ) {
         val appCtx = context.applicationContext
+        val deviceId = GatewayConfig.getDeviceId(appCtx)
+        val deviceName = GatewayConfig.getDeviceName(appCtx)
+        val cleanSender = sender.trim().take(80).ifEmpty { "Unknown" }
+        val cleanBody = body.trim().take(2000)
+        val tsBucket = receivedAtMs / 60_000L
+        val smsHash = sha256Hex("$cleanSender|$cleanBody|$tsBucket").take(32)
+
         val payload = JSONObject().apply {
-            put("deviceId", GatewayConfig.getDeviceId(appCtx))
-            put("deviceName", GatewayConfig.getDeviceName(appCtx))
-            put("smsSender", sender)
-            put("rawBody", body)
+            put("deviceId", deviceId)
+            put("deviceName", deviceName)
+            put("smsSender", cleanSender)
+            put("rawBody", cleanBody)
             put("receivedAtMs", receivedAtMs)
             put("simSlot", simSlot)
             put("isTest", isTest)
-            put("appVersion", "2.0.0-cloud")
+            put("appVersion", "2.1.0-shield")
         }
 
         executor.execute {
+            val db = OfflineSmsDb.getInstance(appCtx)
+            // Write-Ahead local SQLite persistence BEFORE network attempt so offline/killed-app SMS is never lost
+            val walRowId = if (!isTest) {
+                db.enqueue(
+                    smsHash = smsHash,
+                    deviceId = deviceId,
+                    deviceName = deviceName,
+                    smsSender = cleanSender,
+                    rawBody = cleanBody,
+                    receivedAtMs = receivedAtMs,
+                    simSlot = simSlot,
+                    isTest = false
+                )
+            } else -1L
+
             val serverUrl = GatewayConfig.getServerUrl(appCtx)
             val token = GatewayConfig.getGatewayToken(appCtx)
             if (!GatewayConfig.isConfigured(appCtx)) {
-                GatewayConfig.enqueuePendingSms(appCtx, payload)
-                GatewayConfig.appendLocalLog(appCtx, "QUEUED (Paste API Key first): $sender")
+                SmsFlushWorker.scheduleFlush(appCtx)
+                GatewayConfig.appendLocalLog(appCtx, "SQLITE BUFFERED (Paste API Key): $cleanSender")
                 notifyUi(appCtx)
                 onComplete?.invoke(ApiResult(false, 0, "API Key not set"))
                 return@execute
@@ -338,30 +387,36 @@ object GatewayApiClient {
             if (!GatewayConfig.isDirectFirestorePrimary(appCtx)) {
                 res = postJson(appCtx, serverUrl, "/api/deposit-gateway/ingest", token, payload)
                 if (!res.ok) {
-                    val fsOut = postSmsViaFirestore(appCtx, token, sender, body, receivedAtMs, simSlot, isTest)
+                    val fsOut = postSmsViaFirestore(appCtx, token, cleanSender, cleanBody, receivedAtMs, simSlot, isTest)
                     res = fsOut.first
                     parsedInfo = fsOut.second
                 }
             } else {
-                val fsOut = postSmsViaFirestore(appCtx, token, sender, body, receivedAtMs, simSlot, isTest)
+                val fsOut = postSmsViaFirestore(appCtx, token, cleanSender, cleanBody, receivedAtMs, simSlot, isTest)
                 res = fsOut.first
                 parsedInfo = fsOut.second
             }
 
             if (res.ok) {
+                if (walRowId > 0) {
+                    db.deleteByIds(listOf(walRowId))
+                }
                 GatewayConfig.incrementSentCount(appCtx)
-                val logLine = if (parsedInfo != null) {
+                val (trustedSender, _) = GatewayConfig.isTrustedPaymentSender(appCtx, cleanSender)
+                val logLine = if (!trustedSender) {
+                    "🛡 SPOOF FILTERED [$cleanSender]: Quarantined"
+                } else if (parsedInfo != null) {
                     val pMethod = parsedInfo.detectedMethod.orEmpty()
                     val pAmt = parsedInfo.amount?.let { "৳$it" }.orEmpty()
                     val pTrx = parsedInfo.trxId?.let { "TrxID:$it" }.orEmpty()
                     val summary = listOf(pMethod, pAmt, pTrx).filter { it.isNotEmpty() }.joinToString(" • ")
                     if (summary.isNotEmpty()) {
-                        "CLOUD 24/7 OK ✓ [$sender] $summary"
+                        "CLOUD 24/7 OK ✓ [$cleanSender] $summary"
                     } else {
-                        "CLOUD 24/7 OK ✓ [$sender]: ${body.take(45)}"
+                        "CLOUD 24/7 OK ✓ [$cleanSender]: ${cleanBody.take(45)}"
                     }
                 } else {
-                    "SERVER OK ✓ [$sender]: ${body.take(45)}"
+                    "SERVER OK ✓ [$cleanSender]: ${cleanBody.take(45)}"
                 }
                 GatewayConfig.appendLocalLog(appCtx, logLine)
                 flushPendingQueueSync(appCtx)
@@ -371,10 +426,11 @@ object GatewayApiClient {
                 } else {
                     res.message.take(65)
                 }
-                if (!isTest) {
-                    GatewayConfig.enqueuePendingSms(appCtx, payload)
-                    GatewayConfig.appendLocalLog(appCtx, "RETRY QUEUED (${res.code}): $errShort")
-                } else {
+                if (!isTest && walRowId > 0) {
+                    db.markRetryError(listOf(walRowId), errShort)
+                    SmsFlushWorker.scheduleFlush(appCtx)
+                    GatewayConfig.appendLocalLog(appCtx, "SQLITE BUFFERED (${res.code}): $errShort")
+                } else if (isTest) {
                     GatewayConfig.appendLocalLog(appCtx, "TEST FAILED (${res.code}): $errShort")
                 }
             }
@@ -407,12 +463,17 @@ object GatewayApiClient {
                     put("networkType", readNetworkType(appCtx))
                     put("permissionsGranted", hasSmsPermissions(appCtx))
                     put("batteryUnrestricted", isIgnoringBatteryOptimizations(appCtx))
-                    put("queueDepth", GatewayConfig.getPendingQueue(appCtx).size)
+                    put("queueDepth", OfflineSmsDb.getInstance(appCtx).getPendingCount())
                     put("totalSmsSent", GatewayConfig.getTotalSentCount(appCtx))
-                    put("appVersion", "2.0.0-cloud")
+                    put("appVersion", "2.1.0-shield")
                 }
                 val directRes = postJson(appCtx, serverUrl, "/api/deposit-gateway/heartbeat", token, payload)
-                if (directRes.ok) directRes else sendHeartbeatViaFirestore(appCtx, token)
+                if (directRes.ok) {
+                    applyHeartbeatConfigResponse(appCtx, directRes.message)
+                    directRes
+                } else {
+                    sendHeartbeatViaFirestore(appCtx, token)
+                }
             } else {
                 sendHeartbeatViaFirestore(appCtx, token)
             }
@@ -420,59 +481,138 @@ object GatewayApiClient {
         }
     }
 
-    private fun flushPendingQueueSync(context: Context) {
-        if (!GatewayConfig.isConfigured(context)) return
-        val pending = GatewayConfig.getPendingQueue(context)
-        if (pending.isEmpty()) return
+    fun flushPendingQueueAsync(context: Context, onComplete: ((Int) -> Unit)? = null) {
+        val appCtx = context.applicationContext
+        executor.execute {
+            val flushed = flushPendingQueueSync(appCtx)
+            if (flushed > 0) notifyUi(appCtx)
+            onComplete?.invoke(flushed)
+        }
+    }
+
+    @Synchronized
+    fun flushPendingQueueSync(context: Context): Int {
+        if (!GatewayConfig.isConfigured(context)) return 0
+        val db = OfflineSmsDb.getInstance(context)
+        // Migrate any legacy SharedPreferences queue rows into SQLite once
+        val legacy = GatewayConfig.getPendingQueue(context)
+        if (legacy.isNotEmpty()) {
+            for (item in legacy) {
+                val sender = item.optString("smsSender", "Unknown")
+                val rawBody = item.optString("rawBody", "")
+                val ts = item.optLong("receivedAtMs", System.currentTimeMillis())
+                if (rawBody.isNotBlank()) {
+                    val hash = sha256Hex("$sender|$rawBody|${ts / 60_000L}").take(32)
+                    db.enqueue(
+                        smsHash = hash,
+                        deviceId = item.optString("deviceId", GatewayConfig.getDeviceId(context)),
+                        deviceName = item.optString("deviceName", GatewayConfig.getDeviceName(context)),
+                        smsSender = sender,
+                        rawBody = rawBody,
+                        receivedAtMs = ts,
+                        simSlot = item.optInt("simSlot", -1),
+                        isTest = item.optBoolean("isTest", false)
+                    )
+                }
+            }
+            GatewayConfig.replacePendingQueue(context, emptyList())
+        }
 
         val token = GatewayConfig.getGatewayToken(context)
         val serverUrl = GatewayConfig.getServerUrl(context)
         val useDirectFs = GatewayConfig.isDirectFirestorePrimary(context)
+        var totalFlushed = 0
 
-        val remaining = mutableListOf<JSONObject>()
-        var serverDown = false
-        for (item in pending) {
-            if (serverDown) {
-                remaining.add(item)
-                continue
+        while (true) {
+            val batch = db.getBatch(25)
+            if (batch.isEmpty()) break
+
+            val ackIds = mutableListOf<Long>()
+            var batchDoneViaServer = false
+
+            if (!useDirectFs) {
+                val itemsArray = JSONArray()
+                for (row in batch) {
+                    itemsArray.put(
+                        JSONObject().apply {
+                            put("clientRowId", row.id)
+                            put("deviceId", row.deviceId)
+                            put("deviceName", row.deviceName)
+                            put("smsSender", row.smsSender)
+                            put("rawBody", row.rawBody)
+                            put("receivedAtMs", row.receivedAtMs)
+                            put("simSlot", row.simSlot)
+                            put("isTest", row.isTest)
+                        }
+                    )
+                }
+                val batchRes = postJson(
+                    context,
+                    serverUrl,
+                    "/api/deposit-gateway/ingest-batch",
+                    token,
+                    JSONObject().put("items", itemsArray)
+                )
+                if (batchRes.ok) {
+                    try {
+                        val respJson = JSONObject(batchRes.message)
+                        val resultsArr = respJson.optJSONArray("results")
+                        if (resultsArr != null) {
+                            for (i in 0 until resultsArr.length()) {
+                                val r = resultsArr.optJSONObject(i) ?: continue
+                                if (r.optBoolean("ok", false)) {
+                                    val cId = r.optLong("clientRowId", -1L)
+                                    if (cId > 0) ackIds.add(cId)
+                                }
+                            }
+                            batchDoneViaServer = true
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
             }
-            val res = if (!useDirectFs) {
-                val directRes = postJson(context, serverUrl, "/api/deposit-gateway/ingest", token, item)
-                if (directRes.ok) {
-                    directRes
-                } else {
-                    postSmsViaFirestore(
+
+            if (!batchDoneViaServer) {
+                // Direct 24/7 Cloud Bridge flush (row by row with atomic commit per SMS)
+                for (row in batch) {
+                    val res = postSmsViaFirestore(
                         context,
                         token,
-                        item.optString("smsSender", "Unknown"),
-                        item.optString("rawBody", ""),
-                        item.optLong("receivedAtMs", System.currentTimeMillis()),
-                        item.optInt("simSlot", -1),
-                        item.optBoolean("isTest", false)
+                        row.smsSender,
+                        row.rawBody,
+                        row.receivedAtMs,
+                        row.simSlot,
+                        row.isTest
                     ).first
+                    if (res.ok || (res.code in 400..499 && res.code != 429)) {
+                        ackIds.add(row.id)
+                    } else {
+                        db.markRetryError(listOf(row.id), res.message)
+                        SmsFlushWorker.scheduleFlush(context)
+                        return totalFlushed
+                    }
                 }
-            } else {
-                postSmsViaFirestore(
-                    context,
-                    token,
-                    item.optString("smsSender", "Unknown"),
-                    item.optString("rawBody", ""),
-                    item.optLong("receivedAtMs", System.currentTimeMillis()),
-                    item.optInt("simSlot", -1),
-                    item.optBoolean("isTest", false)
-                ).first
             }
 
-            if (res.ok) {
-                GatewayConfig.incrementSentCount(context)
-            } else if (res.code in 400..499 && res.code != 429) {
-                // Drop permanently invalid payload
+            if (ackIds.isNotEmpty()) {
+                db.deleteByIds(ackIds)
+                for (ignored in ackIds) {
+                    GatewayConfig.incrementSentCount(context)
+                }
+                totalFlushed += ackIds.size
             } else {
-                remaining.add(item)
-                serverDown = true
+                break
             }
         }
-        GatewayConfig.replacePendingQueue(context, remaining)
+
+        if (totalFlushed > 0) {
+            GatewayConfig.appendLocalLog(context, "⚡ FLASH-SYNC OK: $totalFlushed buffered SMS uploaded")
+        }
+        return totalFlushed
+    }
+
+    fun notifyUiPublic(context: Context) {
+        notifyUi(context)
     }
 
     private fun notifyUi(context: Context) {
